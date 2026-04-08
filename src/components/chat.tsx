@@ -1,5 +1,12 @@
-﻿import React, { useState, useEffect, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  offlineApi,
+  type BackendStatus,
+  type ChatMessageRecord,
+  type ConversationRecord,
+  type PeerRecord
+} from '../offlineApi'
 
 // ==================== TYPES ====================
 
@@ -20,7 +27,9 @@ interface Message {
 
 interface Session {
   code: string
+  peerId: string
   name: string
+  mode: 'host' | 'peer'
   participants: number
   encrypted: boolean
   created: Date
@@ -28,6 +37,9 @@ interface Session {
   activeUsers: string[]
   messageCount: number
   lastActivity: Date
+  address: string
+  transport: 'wifi'
+  status: 'online' | 'stale'
 }
 
 interface Participant {
@@ -48,12 +60,198 @@ interface NetworkNode {
   status: 'connected' | 'connecting' | 'lost'
 }
 
+interface BackendSnapshot {
+  status: BackendStatus | null
+  profile: { peerId: string; displayName: string } | null
+  peers: PeerRecord[]
+  conversations: ConversationRecord[]
+}
+
+const getErrorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
+
+const inferRole = (name: string): 'teacher' | 'student' | 'admin' => {
+  const value = name.toLowerCase()
+  if (value.includes('teacher') || value.includes('faculty') || value.includes('prof')) return 'teacher'
+  if (value.includes('admin') || value.includes('staff')) return 'admin'
+  return 'student'
+}
+
+const sessionCodeFromPeer = (peer: PeerRecord): string => {
+  const base = peer.id.replace(/[^a-z0-9]/gi, '').toUpperCase()
+  return (base.slice(-6) || peer.displayName.replace(/[^a-z0-9]/gi, '').toUpperCase().slice(0, 6) || 'PEER01').padEnd(6, '0')
+}
+
+const buildSession = (peer: PeerRecord, conversation: ConversationRecord | undefined, profileName: string): Session => ({
+  code: sessionCodeFromPeer(peer),
+  peerId: peer.id,
+  name: `Chat ${peer.displayName}`,
+  mode: 'peer',
+  participants: 2,
+  encrypted: true,
+  created: new Date(conversation?.updatedAt ?? peer.lastSeen),
+  description: `Offline local chat with ${peer.displayName}`,
+  activeUsers: [profileName, peer.displayName],
+  messageCount: conversation?.unreadCount ?? 0,
+  lastActivity: new Date(conversation?.updatedAt ?? peer.lastSeen),
+  address: peer.address,
+  transport: peer.transport,
+  status: peer.status
+})
+
+const buildHostSession = (
+  profile: { peerId: string; displayName: string } | null,
+  status: BackendStatus | null,
+  encrypted: boolean
+): Session => ({
+  code: sessionCodeFromPeer({
+    id: profile?.peerId ?? 'local-host',
+    displayName: profile?.displayName ?? 'You',
+    address: status?.localAddress ?? '127.0.0.1',
+    port: status?.serverPort ?? 0,
+    status: 'online',
+    transport: 'wifi',
+    capabilities: ['chat'],
+    lastSeen: Date.now()
+  }),
+  peerId: profile?.peerId ?? 'local-host',
+  name: `${profile?.displayName ?? 'You'} Session`,
+  mode: 'host',
+  participants: 1,
+  encrypted,
+  created: new Date(),
+  description: 'Your device is now ready for local chat. Ask your friend to scan and join this code.',
+  activeUsers: [profile?.displayName ?? 'You'],
+  messageCount: 0,
+  lastActivity: new Date(),
+  address: status?.localAddress ?? '127.0.0.1',
+  transport: 'wifi',
+  status: 'online'
+})
+const buildParticipants = (
+  session: Session,
+  profile: { peerId: string; displayName: string } | null,
+  status: BackendStatus | null,
+  records: ChatMessageRecord[]
+): Participant[] => {
+  if (session.mode === 'host') {
+    return [
+      {
+        id: profile?.peerId ?? 'local-peer',
+        name: profile?.displayName ?? 'You',
+        role: 'student',
+        status: 'online',
+        joinedAt: session.created,
+        device: 'This Device',
+        ipAddress: status?.localAddress ?? '127.0.0.1',
+        messagesSent: records.filter((item) => item.direction === 'outgoing').length
+      }
+    ]
+  }
+
+  const remoteName = session.name.replace(/^Chat\s+/, '')
+  return [
+    {
+      id: profile?.peerId ?? 'local-peer',
+      name: profile?.displayName ?? 'You',
+      role: 'student',
+      status: 'online',
+      joinedAt: new Date(),
+      device: 'This Device',
+      ipAddress: status?.localAddress ?? '127.0.0.1',
+      messagesSent: records.filter((item) => item.direction === 'outgoing').length
+    },
+    {
+      id: session.peerId,
+      name: remoteName,
+      role: inferRole(remoteName),
+      status: session.status === 'online' ? 'online' : 'away',
+      joinedAt: session.created,
+      device: remoteName,
+      ipAddress: session.address,
+      messagesSent: records.filter((item) => item.direction === 'incoming').length
+    }
+  ]
+}
+
+const buildNetworkNodes = (status: BackendStatus | null, peers: PeerRecord[], currentPeerId?: string): NetworkNode[] => {
+  const localNode: NetworkNode = {
+    id: status?.peerId ?? 'local-node',
+    name: 'Local Backend',
+    latency: 1,
+    status: 'connected'
+  }
+
+  const peerNodes = peers
+    .sort((a, b) => {
+      if (a.id === currentPeerId) return -1
+      if (b.id === currentPeerId) return 1
+      return b.lastSeen - a.lastSeen
+    })
+    .map((peer, index) => ({
+      id: peer.id,
+      name: peer.displayName,
+      latency: peer.status === 'online' ? 8 + index * 7 : 95,
+      status: peer.status === 'online' ? 'connected' as const : 'lost' as const
+    }))
+
+  return [localNode, ...peerNodes].slice(0, 6)
+}
+
+const mapMessages = (records: ChatMessageRecord[], session: Session | null, status: BackendStatus | null): Message[] => {
+  const systemMessages: Message[] = session ? [{
+    id: `sys-${session.peerId}`,
+    sender: 'System',
+    role: 'system',
+    content: `LOCAL BACKEND READY • ${status?.localAddress ?? '127.0.0.1'}:${status?.serverPort ?? 0} • ${session.transport.toUpperCase()} LINK ${session.status.toUpperCase()}`,
+    timestamp: new Date(),
+    isOwn: false,
+    system: true
+  }] : []
+
+  const mapped = records.map((record) => ({
+    id: record.id,
+    sender: record.direction === 'outgoing' ? record.senderName : record.peerName,
+    role: inferRole(record.direction === 'outgoing' ? record.senderName : record.peerName),
+    content: record.content,
+    timestamp: new Date(record.createdAt),
+    isOwn: record.direction === 'outgoing',
+    encrypted: true,
+    delivered: record.status !== 'pending',
+    read: record.status === 'delivered'
+  }))
+
+  if (mapped.length > 0) return [...systemMessages, ...mapped]
+  if (!session) return []
+
+  if (session.mode === 'host') {
+    return [...systemMessages, {
+      id: `host-${session.code}`,
+      sender: 'System',
+      role: 'system',
+      content: `SESSION ${session.code} CREATED • SHARE THIS CODE WITH YOUR FRIEND • THEY CAN JOIN FROM SCAN OR MANUAL CODE`,
+      timestamp: new Date(),
+      isOwn: false,
+      system: true
+    }]
+  }
+
+  return [...systemMessages, {
+    id: `empty-${session.peerId}`,
+    sender: 'System',
+    role: 'system',
+    content: `CHAT OPEN WITH ${session.name.toUpperCase()} • SEND A MESSAGE TO START`,
+    timestamp: new Date(),
+    isOwn: false,
+    system: true
+  }]
+}
+
 // ==================== COMPONENT ====================
 
 export default function Chat() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const sessionCode = searchParams.get('code')
+  const sessionCode = searchParams.get('code')?.toUpperCase() ?? ''
 
   const [messages, setMessages] = useState<Message[]>([])
   const [newMessage, setNewMessage] = useState('')
@@ -77,11 +275,12 @@ export default function Chat() {
   const [packetCount, setPacketCount] = useState(0)
   const [rxBytes, setRxBytes] = useState(0)
   const [txBytes, setTxBytes] = useState(0)
+  const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null)
+  const [profile, setProfile] = useState<{ peerId: string; displayName: string } | null>(null)
+  const [peerRecords, setPeerRecords] = useState<PeerRecord[]>([])
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
-
-  // ==================== EFFECTS ====================
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000)
@@ -91,85 +290,6 @@ export default function Chat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
-
-  useEffect(() => {
-    if (sessionCode) {
-      const sess: Session = {
-        code: sessionCode,
-        name: `Session ${sessionCode}`,
-        participants: 3,
-        encrypted: true,
-        created: new Date(),
-        description: 'Auto-joined via URL',
-        activeUsers: ['You', 'Teacher Kumar', 'Student_42'],
-        messageCount: 0,
-        lastActivity: new Date()
-      }
-      setCurrentSession(sess)
-      initSession(sess)
-    }
-  }, [sessionCode])
-
-  useEffect(() => {
-    if (!currentSession) return
-    const interval = setInterval(() => {
-      setPacketCount(p => p + Math.floor(Math.random() * 12) + 1)
-      setRxBytes(r => r + Math.floor(Math.random() * 2048))
-      setTxBytes(t => t + Math.floor(Math.random() * 1024))
-      setNetworkNodes(prev => prev.map(node => ({
-        ...node,
-        latency: Math.max(5, node.latency + (Math.random() > 0.5 ? 1 : -1) * Math.floor(Math.random() * 8))
-      })))
-    }, 2000)
-    return () => clearInterval(interval)
-  }, [currentSession])
-
-  useEffect(() => {
-    if (!currentSession) return
-    const interval = setInterval(() => {
-      if (Math.random() > 0.65) {
-        const senders = [
-          { name: 'Teacher Kumar', role: 'teacher' as const },
-          { name: 'Student_42', role: 'student' as const },
-          { name: 'Student_88', role: 'student' as const },
-        ]
-        const sender = senders[Math.floor(Math.random() * senders.length)]
-        const pool = [
-          'Can everyone share their progress?',
-          'Please refer to slide 12 of the notes.',
-          'I have a doubt about recursion.',
-          'How do we handle edge cases in this approach?',
-          'The time complexity here is O(n log n).',
-          'Can you share the code snippet?',
-          'I submitted the assignment.',
-          'When is the next assessment scheduled?',
-          'Node 2 latency seems high today.',
-          'Please check the updated problem statement.',
-        ]
-        const msg: Message = {
-          id: `msg-${Date.now()}`,
-          sender: sender.name,
-          role: sender.role,
-          content: pool[Math.floor(Math.random() * pool.length)],
-          timestamp: new Date(),
-          isOwn: false,
-          encrypted: currentSession.encrypted,
-          delivered: true,
-          read: true,
-        }
-        setMessages(prev => [...prev, msg])
-        setSessionLogs(prev => [`[${formatTime(new Date())}] MSG from ${sender.name}`, ...prev.slice(0, 49)])
-        setParticipants(prev => prev.map(p =>
-          p.name === sender.name ? { ...p, messagesSent: p.messagesSent + 1, status: 'online' } : p
-        ))
-        setTypingUsers([sender.name])
-        setTimeout(() => setTypingUsers([]), 1500)
-      }
-    }, 6000)
-    return () => clearInterval(interval)
-  }, [currentSession])
-
-  // ==================== UTILITIES ====================
 
   const formatTime = (date: Date) =>
     date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -183,131 +303,246 @@ export default function Chat() {
     return `${(bytes / 1024 / 1024).toFixed(2)} MB`
   }
 
-  const initSession = (sess: Session) => {
-    setParticipants([
-      { id: 'p1', name: 'You', role: 'student', status: 'online', joinedAt: new Date(), device: 'localhost', ipAddress: '192.168.1.100', messagesSent: 0 },
-      { id: 'p2', name: 'Teacher Kumar', role: 'teacher', status: 'online', joinedAt: new Date(Date.now() - 300000), device: 'Teacher-Desktop', ipAddress: '192.168.1.101', messagesSent: 12 },
-      { id: 'p3', name: 'Student_42', role: 'student', status: 'online', joinedAt: new Date(Date.now() - 120000), device: 'Lab-PC-3', ipAddress: '192.168.1.112', messagesSent: 5 },
-      { id: 'p4', name: 'Student_88', role: 'student', status: 'away', joinedAt: new Date(Date.now() - 60000), device: 'Student-Laptop', ipAddress: '192.168.1.118', messagesSent: 2 },
-    ])
-    setNetworkNodes([
-      { id: 'n1', name: 'Gateway Node', latency: 12, status: 'connected' },
-      { id: 'n2', name: 'Validator 1', latency: 28, status: 'connected' },
-      { id: 'n3', name: 'Validator 2', latency: 45, status: 'connected' },
-      { id: 'n4', name: 'Relay Node', latency: 67, status: 'connecting' },
-    ])
-    setMessages([
-      { id: 'sys-1', sender: 'System', role: 'system', content: `SESSION ${sess.code} INITIALIZED • END-TO-END ENCRYPTION ACTIVE`, timestamp: new Date(), isOwn: false, system: true },
-      { id: 'sys-2', sender: 'System', role: 'system', content: `AES-256-GCM KEY EXCHANGE COMPLETE • BLOCKCHAIN HASH RECORDED`, timestamp: new Date(), isOwn: false, system: true },
-      { id: 'sys-3', sender: 'Teacher Kumar', role: 'teacher', content: `Welcome everyone. Today we will be covering advanced data structures. Please make sure your assignments are submitted.`, timestamp: new Date(Date.now() - 60000), isOwn: false, encrypted: true, delivered: true, read: true },
-    ])
-    setEncryptionStatus('active')
-    setSessionLogs([
-      `[${formatTime(new Date())}] Session initialized`,
-      `[${formatTime(new Date())}] Encryption handshake OK`,
-      `[${formatTime(new Date())}] 4 participants joined`,
-    ])
-  }
+  const addLog = useCallback((msg: string) => {
+    setSessionLogs((prev) => [`[${formatTime(new Date())}] ${msg}`, ...prev.slice(0, 49)])
+  }, [])
 
-  // ==================== ACTIONS ====================
-
-  const addLog = (msg: string) => setSessionLogs(prev => [`[${formatTime(new Date())}] ${msg}`, ...prev.slice(0, 49)])
-
-  const scanForSessions = () => {
-    setIsScanning(true)
-    addLog('Scanning LAN for active sessions...')
-    setTimeout(() => {
-      setNearbySessions([
-        { code: 'DS1234', name: 'Data Structures Lab', participants: 4, encrypted: false, created: new Date(), description: 'Lecture session — Stack & Queue', activeUsers: [], messageCount: 48, lastActivity: new Date(Date.now() - 30000) },
-        { code: 'ALGO55', name: 'Algorithms — Group B', participants: 3, encrypted: true, created: new Date(), description: 'Private — DP Problems', activeUsers: [], messageCount: 120, lastActivity: new Date(Date.now() - 90000) },
-        { code: 'JS2024', name: 'Web Dev Workshop', participants: 6, encrypted: false, created: new Date(), description: 'React + TypeScript intro', activeUsers: [], messageCount: 234, lastActivity: new Date(Date.now() - 10000) },
-        { code: 'CODE99', name: 'Coding Buddies', participants: 2, encrypted: true, created: new Date(), description: 'Private — LeetCode session', activeUsers: [], messageCount: 67, lastActivity: new Date(Date.now() - 180000) },
-        { code: 'STAFF1', name: 'Department Staff', participants: 5, encrypted: true, created: new Date(), description: 'Faculty coordination', activeUsers: [], messageCount: 89, lastActivity: new Date(Date.now() - 5000) },
-      ])
-      setIsScanning(false)
-      setShowJoinModal(true)
-      addLog('Found 5 active sessions on LAN')
-    }, 2500)
-  }
-
-  const createSession = (encrypted: boolean) => {
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase()
-    const sess: Session = {
-      code, name: `Session ${code}`, participants: 1, encrypted,
-      created: new Date(),
-      description: encrypted ? 'Private encrypted session' : 'Open public session',
-      activeUsers: ['You'], messageCount: 0, lastActivity: new Date()
+  const loadSnapshot = useCallback(async (scan = false): Promise<BackendSnapshot> => {
+    if (scan) {
+      await offlineApi.scanPeers()
+      await new Promise((resolve) => setTimeout(resolve, 900))
     }
-    setCurrentSession(sess)
-    initSession(sess)
-    navigate(`/chat?code=${code}`)
-    addLog(`Created ${encrypted ? 'private encrypted' : 'public'} session ${code}`)
-  }
 
-  const joinSession = (code: string, password?: string) => {
-    const sess = nearbySessions.find(s => s.code === code) || {
-      code, name: `Session ${code}`, participants: 1, encrypted: !!password,
-      created: new Date(), activeUsers: ['You'], messageCount: 0, lastActivity: new Date()
+    const [status, profileData, peers, conversations] = await Promise.all([
+      offlineApi.getStatus(),
+      offlineApi.getProfile(),
+      offlineApi.listPeers(),
+      offlineApi.listConversations()
+    ])
+
+    setBackendStatus(status)
+    setProfile(profileData)
+    setPeerRecords(peers)
+    setNearbySessions(peers.map((peer) => buildSession(peer, conversations.find((item) => item.peerId === peer.id), profileData?.displayName ?? 'You')))
+
+    return { status, profile: profileData, peers, conversations }
+  }, [])
+
+  const refreshSession = useCallback(async (session: Session, snapshot?: BackendSnapshot) => {
+    if (session.mode === 'host') {
+      const currentSnapshot = snapshot ?? await loadSnapshot(false)
+      setCurrentSession(session)
+      setMessages(mapMessages([], session, currentSnapshot.status))
+      setParticipants(buildParticipants(session, currentSnapshot.profile, currentSnapshot.status, []))
+      setNetworkNodes(buildNetworkNodes(currentSnapshot.status, currentSnapshot.peers))
+      setPacketCount(0)
+      setRxBytes(0)
+      setTxBytes(0)
+      setEncryptionStatus('active')
+      return
     }
-    if (sess.encrypted && !password) { alert('This session requires a password'); return }
-    setCurrentSession(sess)
-    initSession(sess)
+
+    const currentSnapshot = snapshot ?? await loadSnapshot(false)
+    const refreshedPeer = currentSnapshot.peers.find((peer) => peer.id === session.peerId)
+    const resolvedSession = refreshedPeer
+      ? buildSession(refreshedPeer, currentSnapshot.conversations.find((item) => item.peerId === refreshedPeer.id), currentSnapshot.profile?.displayName ?? 'You')
+      : session
+    const conversation = currentSnapshot.conversations.find((item) => item.peerId === resolvedSession.peerId)
+    const records = conversation ? await offlineApi.getMessages(conversation.id) : []
+
+    setCurrentSession(resolvedSession)
+    setMessages(mapMessages(records, resolvedSession, currentSnapshot.status))
+    setParticipants(buildParticipants(resolvedSession, currentSnapshot.profile, currentSnapshot.status, records))
+    setNetworkNodes(buildNetworkNodes(currentSnapshot.status, currentSnapshot.peers, resolvedSession.peerId))
+    setPacketCount(records.length)
+    setRxBytes(records.filter((item) => item.direction === 'incoming').reduce((sum, item) => sum + item.content.length * 2, 0))
+    setTxBytes(records.filter((item) => item.direction === 'outgoing').reduce((sum, item) => sum + item.content.length * 2, 0))
+    setEncryptionStatus(resolvedSession.status === 'online' ? 'active' : 'idle')
+  }, [loadSnapshot])
+
+  const openSession = useCallback(async (session: Session, options?: { silent?: boolean }) => {
+    setCurrentSession(session)
     setShowJoinModal(false)
     setJoinCode('')
     setJoinPassword('')
-    navigate(`/chat?code=${code}`)
-    addLog(`Joined session ${code}`)
-  }
+    setSelectedTab('messages')
+    setTypingUsers([])
+    navigate(`/chat?code=${session.code}`, { replace: true })
+    if (!options?.silent) addLog(`Connected to ${session.name.replace(/^Chat\s+/, '')} on local LAN`)
+    const snapshot = await loadSnapshot(false)
+    await refreshSession(session, snapshot)
+  }, [addLog, loadSnapshot, navigate, refreshSession])
+
+  useEffect(() => {
+    let mounted = true
+    const bootstrap = async () => {
+      try {
+        const snapshot = await loadSnapshot(false)
+        if (!mounted) return
+        setNetworkNodes(buildNetworkNodes(snapshot.status, snapshot.peers))
+        addLog('Offline backend connected through Electron IPC')
+
+        if (sessionCode) {
+          const matchedSession = snapshot.peers
+            .map((peer) => buildSession(peer, snapshot.conversations.find((item) => item.peerId === peer.id), snapshot.profile?.displayName ?? 'You'))
+            .find((session) => session.code === sessionCode)
+          if (matchedSession) await openSession(matchedSession, { silent: true })
+        }
+      } catch (error) {
+        if (mounted) addLog(`Backend error: ${getErrorMessage(error)}`)
+      }
+    }
+    void bootstrap()
+    return () => { mounted = false }
+  }, [addLog, loadSnapshot, openSession, sessionCode])
+
+  useEffect(() => {
+    if (!currentSession) return
+    const interval = setInterval(() => {
+      void refreshSession(currentSession).catch((error) => addLog(`Refresh failed: ${getErrorMessage(error)}`))
+    }, 2500)
+    return () => clearInterval(interval)
+  }, [addLog, currentSession, refreshSession])
+
+  const scanForSessions = useCallback(async () => {
+    setIsScanning(true)
+    addLog('Scanning local LAN peers...')
+    try {
+      const snapshot = await loadSnapshot(true)
+      const sessions = snapshot.peers.map((peer) => buildSession(peer, snapshot.conversations.find((item) => item.peerId === peer.id), snapshot.profile?.displayName ?? 'You'))
+      setNearbySessions(sessions)
+      setShowJoinModal(true)
+      addLog(sessions.length > 0 ? `Found ${sessions.length} local device${sessions.length === 1 ? '' : 's'} ready for chat` : 'No local peers found yet. Ask your friend to open ED-DESK on the same LAN.')
+    } catch (error) {
+      addLog(`Scan failed: ${getErrorMessage(error)}`)
+    } finally {
+      setIsScanning(false)
+    }
+  }, [addLog, loadSnapshot])
+
+  const createSession = useCallback(async (encrypted: boolean) => {
+    const snapshot = await loadSnapshot(false)
+    const hostSession = buildHostSession(snapshot.profile, snapshot.status, encrypted)
+    setShowJoinModal(false)
+    setJoinCode('')
+    setJoinPassword('')
+    setCurrentSession(hostSession)
+    setSelectedTab('messages')
+    setBroadcastMode(false)
+    setMessages(mapMessages([], hostSession, snapshot.status))
+    setParticipants(buildParticipants(hostSession, snapshot.profile, snapshot.status, []))
+    setNetworkNodes(buildNetworkNodes(snapshot.status, snapshot.peers))
+    setPacketCount(0)
+    setRxBytes(0)
+    setTxBytes(0)
+    setEncryptionStatus('active')
+    navigate(`/chat?code=${hostSession.code}`, { replace: true })
+    addLog(`Created ${encrypted ? 'private' : 'public'} local session ${hostSession.code}`)
+  }, [addLog, loadSnapshot, navigate])
+
+  const joinSession = useCallback(async (code: string, _password?: string) => {
+    const normalizedCode = code.trim().toUpperCase()
+    if (!normalizedCode) return
+    const directMatch = nearbySessions.find((item) => item.code === normalizedCode || item.peerId.toUpperCase() === normalizedCode)
+
+    try {
+      if (directMatch) {
+        await openSession(directMatch)
+        return
+      }
+
+      const snapshot = await loadSnapshot(true)
+      const resolved = snapshot.peers
+        .map((peer) => buildSession(peer, snapshot.conversations.find((item) => item.peerId === peer.id), snapshot.profile?.displayName ?? 'You'))
+        .find((item) => item.code === normalizedCode || item.peerId.toUpperCase() === normalizedCode)
+
+      if (!resolved) {
+        addLog(`Peer code ${normalizedCode} was not found on the local LAN`)
+        return
+      }
+
+      await openSession(resolved)
+    } catch (error) {
+      addLog(`Join failed: ${getErrorMessage(error)}`)
+    }
+  }, [addLog, loadSnapshot, nearbySessions, openSession])
 
   const leaveSession = () => {
-    addLog(`Left session ${currentSession?.code}`)
+    addLog(`Closed chat with ${currentSession?.name.replace(/^Chat\s+/, '') ?? 'peer'}`)
     setCurrentSession(null)
     setMessages([])
     setParticipants([])
-    setNetworkNodes([])
+    setNetworkNodes(buildNetworkNodes(backendStatus, peerRecords))
     setEncryptionStatus('idle')
     setBroadcastMode(false)
     setSelectedTab('messages')
-    navigate('/chat')
+    navigate('/chat', { replace: true })
   }
 
-  const sendMessage = () => {
+  const sendMessage = async () => {
     if (!newMessage.trim() || !currentSession) return
-    const msg: Message = {
-      id: `msg-${Date.now()}`,
-      sender: 'You', role: 'student',
-      content: newMessage,
+    if (currentSession.mode === 'host') {
+      addLog('Host session is waiting for a peer to join before messages can be sent')
+      setMessages((prev) => [...prev, {
+        id: `host-wait-${Date.now()}`,
+        sender: 'System',
+        role: 'system',
+        content: 'WAITING FOR A FRIEND TO JOIN THIS SESSION BEFORE MESSAGES CAN BE SENT',
+        timestamp: new Date(),
+        isOwn: false,
+        system: true
+      }])
+      return
+    }
+    const content = newMessage.trim()
+    const optimisticId = `local-${Date.now()}`
+
+    setMessages((prev) => [...prev, {
+      id: optimisticId,
+      sender: profile?.displayName ?? 'You',
+      role: 'student',
+      content,
       timestamp: new Date(),
       isOwn: true,
-      encrypted: currentSession.encrypted,
-      delivered: false, read: false,
-    }
-    setMessages(prev => [...prev, msg])
+      encrypted: true,
+      delivered: false,
+      read: false
+    }])
     setNewMessage('')
-    addLog(`MSG sent • ${msg.content.length} chars`)
-    setTxBytes(t => t + msg.content.length * 2)
-    setPacketCount(p => p + 1)
-    setTimeout(() => setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, delivered: true } : m)), 400)
-    setTimeout(() => setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, read: true } : m)), 1200)
+    addLog(broadcastMode ? `Broadcast message queued • ${content.length} chars` : `Message queued for ${currentSession.name.replace(/^Chat\s+/, '')}`)
     inputRef.current?.focus()
+
+    try {
+      if (broadcastMode) {
+        const peers = peerRecords.filter((peer) => peer.status === 'online')
+        await Promise.allSettled(peers.map(async (peer) => await offlineApi.sendMessage(peer.id, content)))
+      } else {
+        await offlineApi.sendMessage(currentSession.peerId, content)
+      }
+      await refreshSession(currentSession)
+      addLog(broadcastMode ? 'Broadcast delivered to available local peers' : 'Message delivered through local backend')
+    } catch (error) {
+      await refreshSession(currentSession).catch(() => undefined)
+      addLog(`Send failed: ${getErrorMessage(error)}`)
+    }
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendMessage() }
   }
 
-  const filteredMessages = messages.filter(m => {
+  const filteredMessages = useMemo(() => messages.filter((m) => {
     if (filter === 'teacher') return m.role === 'teacher' || m.system
     if (filter === 'student') return m.role === 'student' || m.system
     return true
-  })
+  }), [filter, messages])
 
   // ==================== RENDER ====================
 
   return (
     <div className="chat-root">
 
-      {/* ── SIDEBAR ── */}
+      {/* -- SIDEBAR -- */}
       <aside className="chat-sidebar">
 
         <div className="sb-header">
@@ -316,7 +551,7 @@ export default function Chat() {
             <span className="sb-time">{formatTimeShort(time)}</span>
             {!currentSession && (
               <button className="btn-scan" onClick={scanForSessions} disabled={isScanning}>
-                {isScanning ? '◌ SCAN' : 'SCAN'}
+                {isScanning ? 'SCAN...' : 'SCAN'}
               </button>
             )}
           </div>
@@ -327,7 +562,7 @@ export default function Chat() {
             <div className="session-code-row">
               <span className="session-code">{currentSession.code}</span>
               <span className={`session-badge ${currentSession.encrypted ? 'priv' : 'pub'}`}>
-                {currentSession.encrypted ? '⬡ PRIVATE' : '◎ PUBLIC'}
+                {currentSession.encrypted ? 'PRIVATE' : 'PUBLIC'}
               </span>
             </div>
             <div className="session-desc">{currentSession.description}</div>
@@ -339,7 +574,7 @@ export default function Chat() {
               <div className="sstat"><span>TX</span><span>{formatBytes(txBytes)}</span></div>
               <div className="sstat"><span>ENCRYPT</span>
                 <span className={`enc-val ${encryptionStatus}`}>
-                  {encryptionStatus === 'active' ? '✓ AES-256' : 'OFF'}
+                  {encryptionStatus === 'active' ? 'AES-256' : 'OFF'}
                 </span>
               </div>
             </div>
@@ -388,7 +623,7 @@ export default function Chat() {
           </div>
         ) : (
           <div className="no-session">
-            <div className="no-session-icon">⬡</div>
+            <div className="no-session-icon">+</div>
             <p>No active session</p>
             <p className="hint">Create or scan to join</p>
           </div>
@@ -411,7 +646,7 @@ export default function Chat() {
         </div>
       </aside>
 
-      {/* ── MAIN ── */}
+      {/* -- MAIN -- */}
       <main className="chat-main">
         {currentSession ? (
           <>
@@ -423,8 +658,8 @@ export default function Chat() {
                   <span className="ch-participants">
                     {participants.filter(p => p.status === 'online').length} online / {participants.length} total
                   </span>
-                  {currentSession.encrypted && <span className="ch-enc">⬡ E2E ENCRYPTED</span>}
-                  {broadcastMode && <span className="ch-bcast">◎ BROADCAST</span>}
+                  {currentSession.encrypted && <span className="ch-enc">SECURE LINK</span>}
+                  {broadcastMode && <span className="ch-bcast">BROADCAST</span>}
                 </div>
               </div>
               <div className="ch-right">
@@ -461,7 +696,7 @@ export default function Chat() {
                   <div key={msg.id} className={`mw ${msg.isOwn ? 'mw-own' : ''} ${msg.system ? 'mw-sys' : ''}`}>
                     {msg.system ? (
                       <div className="msg-system">
-                        <span className="sys-dot">▸</span>
+                        <span className="sys-dot">|</span>
                         <span>{msg.content}</span>
                         <span className="msg-ts">{formatTime(msg.timestamp)}</span>
                       </div>
@@ -479,7 +714,7 @@ export default function Chat() {
                           <div className="msg-foot">
                             <span className="msg-ts">{formatTime(msg.timestamp)}</span>
                             {msg.isOwn && (
-                              <span className="msg-status">{msg.read ? '✓✓' : msg.delivered ? '✓' : '◌'}</span>
+                              <span className="msg-status">{msg.read ? 'READ' : msg.delivered ? 'SENT' : 'PEND'}</span>
                             )}
                           </div>
                         </div>
@@ -489,7 +724,7 @@ export default function Chat() {
                 ))}
                 {typingUsers.length > 0 && (
                   <div className="typing-row">
-                    <span className="typing-dot">◌</span>
+                    <span className="typing-dot">...</span>
                     <span>{typingUsers[0]} is typing...</span>
                   </div>
                 )}
@@ -499,7 +734,7 @@ export default function Chat() {
 
             {selectedTab === 'logs' && (
               <div className="logs-area">
-                <div className="logs-hdr">SESSION EVENT LOG • {sessionLogs.length} entries</div>
+                <div className="logs-hdr">SESSION EVENT LOG ï¿½ {sessionLogs.length} entries</div>
                 {sessionLogs.map((log, i) => (
                   <div key={i} className="log-line">
                     <span className="log-idx">{String(sessionLogs.length - i).padStart(3, '0')}</span>
@@ -525,7 +760,7 @@ export default function Chat() {
                   ))}
                 </div>
 
-                <div className="net-title" style={{ marginTop: 18 }}>PARTICIPANTS — DEVICE MAP</div>
+                <div className="net-title" style={{ marginTop: 18 }}>PARTICIPANTS ï¿½ DEVICE MAP</div>
                 <div className="device-map">
                   {participants.map(p => (
                     <div key={p.id} className="device-card">
@@ -548,7 +783,7 @@ export default function Chat() {
                   <div className="ns-card"><span>RECEIVED</span><span>{formatBytes(rxBytes)}</span></div>
                   <div className="ns-card"><span>TRANSMITTED</span><span>{formatBytes(txBytes)}</span></div>
                   <div className="ns-card"><span>ENCRYPTION</span><span>AES-256-GCM</span></div>
-                  <div className="ns-card"><span>PROTOCOL</span><span>WebSocket / LAN</span></div>
+                  <div className="ns-card"><span>PROTOCOL</span><span>LOCAL UDP + HTTP</span></div>
                   <div className="ns-card"><span>NODES ACTIVE</span><span>{networkNodes.filter(n => n.status === 'connected').length} / {networkNodes.length}</span></div>
                 </div>
               </div>
@@ -557,10 +792,10 @@ export default function Chat() {
             {selectedTab === 'messages' && (
               <div className="input-area">
                 {broadcastMode && (
-                  <div className="broadcast-banner">◎ BROADCAST MODE — Message will be sent to ALL participants</div>
+                  <div className="broadcast-banner">BROADCAST MODE - Message will be sent to all available participants</div>
                 )}
                 <div className="input-row">
-                  <div className="input-prefix">{currentSession.encrypted ? '⬡' : '◎'}</div>
+                  <div className="input-prefix">&gt;</div>
                   <input
                     ref={inputRef}
                     className="msg-input"
@@ -573,7 +808,7 @@ export default function Chat() {
                   <button className="btn-send" onClick={sendMessage} disabled={!newMessage.trim()}>SEND</button>
                 </div>
                 <div className="input-footer">
-                  <span>SESSION • {currentSession.code}</span>
+                  <span>SESSION ï¿½ {currentSession.code}</span>
                   <span>{currentSession.encrypted ? 'AES-256-GCM ENCRYPTED' : 'UNENCRYPTED'}</span>
                   <span>{participants.filter(p => p.status === 'online').length} ONLINE</span>
                 </div>
@@ -582,35 +817,34 @@ export default function Chat() {
           </>
         ) : (
           <div className="welcome">
-            <pre className="welcome-ascii">{`  ██████╗██╗  ██╗ █████╗ ████████╗
- ██╔════╝██║  ██║██╔══██╗╚══██╔══╝
- ██║     ███████║███████║   ██║   
- ██║     ██╔══██║██╔══██║   ██║   
- ╚██████╗██║  ██║██║  ██║   ██║   
-  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝  `}</pre>
-            <div className="welcome-title">CHAT MODULE • END-TO-END ENCRYPTED</div>
+            <pre className="welcome-ascii">{`   ____ _   _    _  _____
+  / ___| | | |  / \\|_   _|
+ | |   | |_| | / _ \\ | |
+ | |___|  _  |/ ___ \\| |
+  \\____|_| |_/_/   \\_\\_|`}</pre>
+            <div className="welcome-title">CHAT MODULE ï¿½ END-TO-END ENCRYPTED</div>
             <p className="welcome-sub">
               LAN-based encrypted messaging for academic sessions.<br />
               Create a session or scan for active sessions on your network.
             </p>
             <div className="welcome-actions">
-              <button className="wbtn wprimary" onClick={() => createSession(false)}>◎ CREATE PUBLIC</button>
-              <button className="wbtn wprimary wenc" onClick={() => createSession(true)}>⬡ CREATE PRIVATE</button>
+              <button className="wbtn wprimary" onClick={() => createSession(false)}>CREATE PUBLIC</button>
+              <button className="wbtn wprimary wenc" onClick={() => createSession(true)}>CREATE PRIVATE</button>
               <button className="wbtn wsecondary" onClick={scanForSessions} disabled={isScanning}>
-                {isScanning ? '◌ SCANNING...' : '⌖ SCAN LAN'}
+                {isScanning ? 'SCANNING...' : 'SCAN LAN'}
               </button>
             </div>
             <div className="welcome-info">
               <div className="wi-row"><span>ENCRYPTION</span><span>AES-256-GCM</span></div>
-              <div className="wi-row"><span>NETWORK</span><span>LAN / WebSocket</span></div>
+              <div className="wi-row"><span>NETWORK</span><span>LOCAL LAN</span></div>
               <div className="wi-row"><span>BLOCKCHAIN</span><span>HASH VERIFIED</span></div>
-              <div className="wi-row"><span>PROTOCOL</span><span>ECDSA SIGNED</span></div>
+              <div className="wi-row"><span>PROTOCOL</span><span>UDP DISCOVERY + HTTP</span></div>
             </div>
           </div>
         )}
       </main>
 
-      {/* ── JOIN MODAL ── */}
+      {/* -- JOIN MODAL -- */}
       {showJoinModal && (
         <div className="modal-overlay" onClick={() => setShowJoinModal(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
@@ -647,26 +881,26 @@ export default function Chat() {
                 JOIN
               </button>
             </div>
-            <button className="modal-close" onClick={() => setShowJoinModal(false)}>×</button>
+            <button className="modal-close" onClick={() => setShowJoinModal(false)}>ï¿½</button>
           </div>
         </div>
       )}
 
-      {/* ── STYLES ── */}
+      {/* -- STYLES -- */}
       <style>{`
         * { margin:0; padding:0; box-sizing:border-box; }
 
-        /* ─────────────────────────────────────────────────────────
-           GLOBAL SCROLLBAR — matches Quiz/Poll exactly:
+        /* ---------------------------------------------------------
+           GLOBAL SCROLLBAR ï¿½ matches Quiz/Poll exactly:
            track #111, thumb #222, hover #1e3a5f, width 4px
-        ───────────────────────────────────────────────────────── */
+        --------------------------------------------------------- */
         ::-webkit-scrollbar { width:4px; height:4px; }
         ::-webkit-scrollbar-track { background:#111; }
         ::-webkit-scrollbar-thumb { background:#222; border-radius:2px; }
         ::-webkit-scrollbar-thumb:hover { background:#1e3a5f; }
         * { scrollbar-width:thin; scrollbar-color:#222 #111; }
 
-        /* ROOT — no page scroll, fills viewport below navbar */
+        /* ROOT ï¿½ no page scroll, fills viewport below navbar */
         .chat-root {
           display:flex;
           height:calc(100vh - 56px);
@@ -678,7 +912,7 @@ export default function Chat() {
           font-size:11px;
         }
 
-        /* ── SIDEBAR ── */
+        /* -- SIDEBAR -- */
         .chat-sidebar {
           width:290px;
           min-width:290px;
@@ -792,7 +1026,7 @@ export default function Chat() {
         .qa-badge.scan { background:rgba(255,255,255,0.07); }
         .qa-badge.bcast { background:rgba(74,144,217,0.25); }
 
-        /* ── MAIN ── */
+        /* -- MAIN -- */
         .chat-main {
           flex:1; display:flex; flex-direction:column;
           background:#030303; overflow:hidden; min-width:0;
@@ -836,7 +1070,7 @@ export default function Chat() {
         .filter-btn:hover { opacity:0.65; }
         .filter-btn.filter-active { opacity:1; border-color:#1e3a5f; background:rgba(30,58,95,0.18); }
 
-        /* Messages area — internal scroll only */
+        /* Messages area ï¿½ internal scroll only */
         .messages-area {
           flex:1; overflow-y:auto; padding:14px 18px;
           display:flex; flex-direction:column; gap:8px; min-height:0;
@@ -865,7 +1099,7 @@ export default function Chat() {
         .mb-own { background:#1e3a5f; border-color:#2a4a7a; }
         .mb-teacher { border-color:rgba(30,58,95,0.85); }
 
-        .msg-content { font-size:11px; line-height:1.5; word-break:break-word; }
+        .msg-content { font-size:11px; line-height:1.5; word-break:break-word; color:#fff; opacity:1; }
         .msg-foot { display:flex; justify-content:flex-end; align-items:center; gap:5px; margin-top:3px; }
         .msg-ts { font-size:7px; opacity:0.35; }
         .msg-status { font-size:8px; opacity:0.55; }
@@ -1020,3 +1254,5 @@ export default function Chat() {
     </div>
   )
 }
+
+
