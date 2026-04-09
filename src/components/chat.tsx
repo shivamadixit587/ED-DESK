@@ -78,7 +78,7 @@ const buildPeerSession = (
   conv: ConversationRecord | undefined,
   profileName: string
 ): Session => ({
-  code: peer.hostedSession?.code ?? peer.id.slice(-6).toUpperCase(),
+  code: conv?.sessionCode ?? peer.hostedSession?.code ?? peer.id.slice(-6).toUpperCase(),
   peerId: peer.id,
   name: `Chat · ${peer.displayName}`,
   mode: 'peer',
@@ -105,6 +105,23 @@ const findConversationForSession = (
   return conversations.find((item) =>
     item.peerId === peerId && (item.sessionCode ?? null) === normalizedCode
   )
+}
+
+const findBestConversationForSession = (
+  conversations: ConversationRecord[],
+  peerId: string,
+  sessionCode?: string | null
+) => {
+  const exact = findConversationForSession(conversations, peerId, sessionCode)
+  if (exact) return exact
+
+  const peerConversations = conversations
+    .filter((item) => item.peerId === peerId)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+
+  if (peerConversations.length === 1) return peerConversations[0]
+
+  return peerConversations.find((item) => item.sessionCode) ?? peerConversations[0]
 }
 
 const saveActiveSession = (session: Session | null) => {
@@ -292,14 +309,14 @@ export default function Chat() {
         .filter(p => p.hostedSession)
         .map(p => buildPeerSession(
           p,
-          findConversationForSession(convs, p.id, p.hostedSession?.code),
+          findBestConversationForSession(convs, p.id, p.hostedSession?.code),
           profileData?.displayName ?? 'You'
         ))
 
       const allSessions = peers.map(p =>
         buildPeerSession(
           p,
-          findConversationForSession(convs, p.id, p.hostedSession?.code),
+          findBestConversationForSession(convs, p.id, p.hostedSession?.code),
           profileData?.displayName ?? 'You'
         )
       )
@@ -480,7 +497,7 @@ export default function Chat() {
           messagesSent: 0
         })
 
-        const conv = findConversationForSession(snap.convs, pid, session.code)
+        const conv = findBestConversationForSession(snap.convs, pid, session.code)
         if (!conv) continue
         const records = await offlineApi.getMessages(conv.id).catch(() => [] as ChatMessageRecord[])
         allRecords.push(...records)
@@ -508,7 +525,7 @@ export default function Chat() {
       return
     }
 
-    const conversationId = findConversationForSession(snap.convs, session.peerId, session.code)?.id ?? session.conversationId
+    const conversationId = findBestConversationForSession(snap.convs, session.peerId, session.code)?.id ?? session.conversationId
     const updatedSession: Session = {
       ...session,
       status: sessionStatus,
@@ -576,7 +593,7 @@ export default function Chat() {
 
     // Rebuild with fresh conv id
     if (session.mode === 'peer' && snap) {
-      const freshConv = findConversationForSession(snap.convs, session.peerId, session.code)
+      const freshConv = findBestConversationForSession(snap.convs, session.peerId, session.code)
       const freshSession = { ...session, conversationId: freshConv?.id ?? null }
       setCurrentSession(freshSession)
       setParticipants([
@@ -662,7 +679,7 @@ export default function Chat() {
       }
 
       const savedPeer = snap.peers.find(p => p.id === savedSession.peerId)
-      const savedConv = findConversationForSession(snap.convs, savedSession.peerId, savedSession.code)
+      const savedConv = findBestConversationForSession(snap.convs, savedSession.peerId, savedSession.code)
       if (savedPeer) {
         await openSession(buildPeerSession(savedPeer, savedConv, snap.profile?.displayName ?? 'You'))
         return
@@ -721,7 +738,7 @@ export default function Chat() {
         .filter(p => p.hostedSession)
         .map(p => buildPeerSession(
           p,
-          findConversationForSession(snap.convs, p.id, p.hostedSession?.code),
+          findBestConversationForSession(snap.convs, p.id, p.hostedSession?.code),
           snap.profile?.displayName ?? 'You'
         ))
       setNearbySessions(sessions)
@@ -820,7 +837,7 @@ export default function Chat() {
 
       const peer = freshSnap.peers.find(p => p.id === backendSession.hostPeerId)
       if (peer) {
-        const conv = findConversationForSession(freshSnap.convs, peer.id, normalizedCode)
+        const conv = findBestConversationForSession(freshSnap.convs, peer.id, normalizedCode)
         const session = buildPeerSession(peer, conv, freshSnap.profile?.displayName ?? 'You')
         await openSession(session)
       } else {
@@ -840,7 +857,7 @@ export default function Chat() {
           address: '',
           transport: 'wifi',
           status: 'online',
-          conversationId: findConversationForSession(freshSnap.convs, backendSession.hostPeerId, normalizedCode)?.id ?? null,
+          conversationId: findBestConversationForSession(freshSnap.convs, backendSession.hostPeerId, normalizedCode)?.id ?? null,
           backendSessionId: backendSession.id
         }
         await openSession(minimalSession)
@@ -1593,8 +1610,8 @@ export default function Chat() {
           flex:1; overflow-y:auto; padding:14px 18px;
           display:flex; flex-direction:column; gap:8px; min-height:0;
         }
-        .mw { display:flex; flex-direction:column; max-width:70%; }
-        .mw-own { align-self:flex-end; }
+        .mw { display:flex; flex-direction:column; align-items:flex-start; max-width:min(70%, 560px); }
+        .mw-own { align-self:flex-end; align-items:flex-end; }
         .mw-sys { align-self:center; max-width:100%; }
         .msg-sys {
           display:flex; align-items:center; gap:7px; font-size:8px; opacity:0.3;
@@ -1609,7 +1626,7 @@ export default function Chat() {
         .role-admin   { background:rgba(180,100,50,0.4); }
         .msg-sndr { font-size:9px; opacity:0.6; }
         .enc-tag { font-size:6px; opacity:0.3; border:1px solid #222; padding:1px 3px; }
-        .msg-bub { background:#0e0e0e; border:1px solid #1e3a5f; padding:7px 11px; }
+        .msg-bub { display:inline-block; width:fit-content; max-width:100%; background:#0e0e0e; border:1px solid #1e3a5f; padding:7px 11px; }
         .bub-own { background:#1e3a5f; border-color:#2a4a7a; }
         .msg-cnt { font-size:11px; line-height:1.5; word-break:break-word; }
         .msg-foot { display:flex; justify-content:flex-end; align-items:center; gap:5px; margin-top:3px; }

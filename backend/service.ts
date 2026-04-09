@@ -34,6 +34,7 @@ interface PeerMessagePayload {
   recipientName: string
   content: string
   timestamp: number
+  serverPort: number
   sessionCode?: string
 }
 
@@ -41,6 +42,7 @@ interface JoinSessionPayload {
   peerId: string
   peerName: string
   code: string
+  serverPort: number
   password?: string
 }
 
@@ -104,14 +106,14 @@ export class OfflineBackendService {
 
         if (request.method === 'POST' && url.pathname === '/api/peer/message') {
           const payload = await this.readJson<PeerMessagePayload>(request)
-          const message = this.receivePeerMessage(payload)
+          const message = this.receivePeerMessage(payload, request.socket.remoteAddress)
           this.writeJson(response, 200, { ok: true, message })
           return
         }
 
         if (request.method === 'POST' && url.pathname === '/api/peer/session/join') {
           const payload = await this.readJson<JoinSessionPayload>(request)
-          const session = this.acceptSessionJoin(payload)
+          const session = this.acceptSessionJoin(payload, request.socket.remoteAddress)
           this.writeJson(response, 200, { ok: true, session })
           return
         }
@@ -298,6 +300,31 @@ export class OfflineBackendService {
     return '127.0.0.1'
   }
 
+  private normalizeRemoteAddress(address?: string | null): string {
+    if (!address) return ''
+    return address.startsWith('::ffff:') ? address.slice(7) : address
+  }
+
+  private upsertPeerConnection(
+    peerId: string,
+    displayName: string,
+    serverPort: number,
+    remoteAddress?: string | null
+  ): void {
+    const existing = this.database.getPeer(peerId)
+    this.database.upsertPeer({
+      id: peerId,
+      displayName,
+      address: this.normalizeRemoteAddress(remoteAddress) || existing?.address || '',
+      port: serverPort || existing?.port || 0,
+      status: 'online',
+      transport: 'wifi',
+      capabilities: existing?.capabilities ?? ['chat', 'assessment', 'ledger'],
+      lastSeen: Date.now(),
+      hostedSession: existing?.hostedSession ?? null
+    })
+  }
+
   getStatus(): BackendStatus {
     return {
       peerId: this.peerId,
@@ -439,6 +466,7 @@ export class OfflineBackendService {
       peerId: this.peerId,
       peerName: this.displayName,
       code: normalizedCode,
+      serverPort: this.serverPort,
       password
     } satisfies JoinSessionPayload)
 
@@ -455,7 +483,7 @@ export class OfflineBackendService {
     return response.session
   }
 
-  private acceptSessionJoin(payload: JoinSessionPayload): SessionRecord {
+  private acceptSessionJoin(payload: JoinSessionPayload, remoteAddress?: string | null): SessionRecord {
     const hosted = this.database.getHostedSession()
     if (!hosted || hosted.code !== payload.code.trim().toUpperCase()) {
       throw new Error('Requested session is no longer available.')
@@ -467,6 +495,9 @@ export class OfflineBackendService {
     const participantIds = hosted.participantPeerIds.includes(payload.peerId)
       ? hosted.participantPeerIds
       : [...hosted.participantPeerIds, payload.peerId]
+
+    this.upsertPeerConnection(payload.peerId, payload.peerName, payload.serverPort, remoteAddress)
+
     const updated: SessionRecord = {
       ...hosted,
       participantPeerIds: participantIds,
@@ -536,6 +567,7 @@ export class OfflineBackendService {
         recipientName: peer.displayName,
         content,
         timestamp: createdAt,
+        serverPort: this.serverPort,
         sessionCode: normalizedSessionCode ?? undefined
       } satisfies PeerMessagePayload)
 
@@ -552,12 +584,13 @@ export class OfflineBackendService {
     }
   }
 
-  receivePeerMessage(payload: PeerMessagePayload): ChatMessageRecord {
+  receivePeerMessage(payload: PeerMessagePayload, remoteAddress?: string | null): ChatMessageRecord {
+    this.upsertPeerConnection(payload.peerId, payload.peerName, payload.serverPort, remoteAddress)
     const peer = this.database.getPeer(payload.peerId) ?? {
       id: payload.peerId,
       displayName: payload.peerName,
-      address: '',
-      port: 0,
+      address: this.normalizeRemoteAddress(remoteAddress),
+      port: payload.serverPort,
       status: 'online' as const,
       transport: 'wifi' as const,
       capabilities: ['chat'],
